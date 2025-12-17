@@ -1,477 +1,349 @@
-# Implementation Plan: Lazy Tool Description Loading
+# Implementation Plan: Lazy Tool Description Loading (Simplified)
 
 ## Problem Statement
 
-When an agent has many tools, sending full descriptions for all tools in every API call:
-- Consumes significant context window space
-- Increases token costs
-- May hit context limits with large tool sets
+When an agent has many tools, sending full descriptions for all tools in every API call consumes significant context window space and increases token costs.
 
-## Proposed Solution: Progressive Tool Description Expansion
+## Key Discovery
 
-Provide abbreviated tool descriptions initially, allowing the model to request full descriptions for tools it intends to use. This trades an extra API call for significant context savings.
+**There is ONE single injection point** at `event_loop.py:339` where ALL tool specs (regular + MCP) pass through before going to the model. This enables a fully encapsulated solution.
 
 ---
 
-## Design Options
+## Simplified Design: Standalone Handler Class
 
-### Option A: Meta-Tool Pattern (Recommended)
+Create a single `LazyToolHandler` class that:
+1. Lives in ONE new file
+2. Contains ALL logic (transformation, expand_tool, state tracking)
+3. Is optionally passed to Agent
+4. When `None`, zero code paths are affected
 
-Add a special `expand_tool` meta-tool that the model calls to get full descriptions.
-
-**Flow:**
-```
-1. Agent sends: [tool_name + summary] for all tools + expand_tool
-2. Model decides it needs "complex_tool"
-3. Model calls: expand_tool(name="complex_tool")
-4. System returns: full description + schema details
-5. Model calls: complex_tool(params...)
-```
-
-**Pros:**
-- Clean, explicit pattern
-- Model controls when to expand
-- Works with existing tool infrastructure
-- No changes to model providers
-
-**Cons:**
-- Adds 1 API round-trip per tool expansion
-- Model must learn to use the meta-tool
-
----
-
-### Option B: Automatic Expansion on First Use
-
-Intercept tool calls, check if model has seen full description, expand if needed.
-
-**Flow:**
-```
-1. Agent sends: [tool_name + summary] for all tools
-2. Model calls: complex_tool(params...)
-3. System intercepts, sees tool not expanded
-4. System re-prompts with full description
-5. Model confirms/adjusts call
-6. Tool executes
-```
-
-**Pros:**
-- Transparent to model
-- No meta-tool needed
-
-**Cons:**
-- May cause incorrect tool usage on first attempt
-- More complex state management
-- Potential for wasted API calls if params were wrong
-
----
-
-### Option C: Hybrid - Summary with On-Demand Schema
-
-Send descriptions but defer parameter schemas until needed.
-
-**Flow:**
-```
-1. Agent sends: [tool_name + description] (no inputSchema)
-2. Model indicates intent: "I want to use complex_tool"
-3. System provides: full inputSchema
-4. Model calls with correct params
-```
-
-**Pros:**
-- Schemas are often the largest part of tool definitions
-- Description helps model decide relevance
-
-**Cons:**
-- Requires model behavior change
-- Less context savings than full lazy loading
-
----
-
-## Recommended Approach: Option A (Meta-Tool Pattern)
-
-### Architecture Overview
+### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Agent                                 │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              ToolRegistry                            │    │
-│  │  ┌──────────────┐  ┌──────────────────────────┐     │    │
-│  │  │ LazyToolSpec │  │ ExpandedToolCache        │     │    │
-│  │  │ - name       │  │ - expanded_tools: set    │     │    │
-│  │  │ - summary    │  │ - get_full_spec()        │     │    │
-│  │  │ - full_spec  │  └──────────────────────────┘     │    │
-│  │  └──────────────┘                                   │    │
-│  └─────────────────────────────────────────────────────┘    │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │           ExpandToolMetaTool                         │    │
-│  │  - Returns full description for requested tool       │    │
-│  │  - Marks tool as "expanded" in cache                 │    │
-│  └─────────────────────────────────────────────────────┘    │
+│  event_loop.py:339                                          │
+│                                                             │
+│  tool_specs = agent.tool_registry.get_all_tool_specs()      │
+│                                                             │
+│  # NEW: Single injection point                              │
+│  if agent.lazy_tool_handler:                                │
+│      tool_specs = agent.lazy_tool_handler.transform(        │
+│          tool_specs, invocation_state                       │
+│      )                                                      │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  LazyToolHandler (single file, fully self-contained)        │
+│                                                             │
+│  - transform(specs, state) → abbreviated specs + expand_tool│
+│  - expand_tool implementation (registered as tool)          │
+│  - summary extraction logic                                 │
+│  - expanded state tracking                                  │
+│  - optional: block unexpanded tool calls                    │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Implementation Plan
+## Implementation
 
-### Phase 1: Core Data Structures
-
-#### 1.1 Extend ToolSpec Type
-**File:** `src/strands/types/tools.py`
+### File 1: `src/strands/tools/lazy_tool_handler.py` (NEW - all logic here)
 
 ```python
-class LazyToolSpec(TypedDict, total=False):
-    """Tool specification with lazy description loading."""
-    name: str
-    summary: str  # Short description (1-2 sentences)
-    description: str  # Full description (only populated when expanded)
-    inputSchema: InputSchema
-    outputSchema: JSONSchema
+"""Lazy tool description loading - reduces context by deferring full tool descriptions."""
 
-class ToolDescriptionMode(Enum):
-    """How tool descriptions are provided to the model."""
-    FULL = "full"           # All descriptions sent upfront (current behavior)
-    LAZY = "lazy"           # Summary only, expand on demand
-    HYBRID = "hybrid"       # Description without schema until needed
-```
+from __future__ import annotations
 
-#### 1.2 Add Summary Field to Tool Decorator
-**File:** `src/strands/tools/decorator.py`
+import json
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
-```python
-@tool(
-    name="my_tool",
-    summary="Brief one-liner for lazy mode",  # NEW
-    description="Full detailed description..."
-)
-def my_tool(...):
-    ...
-```
+from strands.tools.decorator import tool
+from strands.types.tools import ToolSpec
 
-- Extract first sentence of docstring as default summary
-- Allow explicit `summary` parameter override
+if TYPE_CHECKING:
+    from strands.agent import Agent
 
----
 
-### Phase 2: Meta-Tool Implementation
-
-#### 2.1 Create ExpandTool
-**File:** `src/strands/tools/expand_tool.py` (new file)
-
-```python
-@tool(
-    name="expand_tool",
-    description="Get the full description and parameter schema for a tool before using it. "
-                "Call this when you need more details about how to use a specific tool."
-)
-def expand_tool(
-    tool_name: str,
-    *,
-    _agent: "Agent",  # Injected
-    _invocation_state: dict,  # Injected
-) -> str:
+@dataclass
+class LazyToolHandler:
     """
-    Expand a tool's description to see its full details.
+    Handles lazy loading of tool descriptions to save context.
 
-    Args:
-        tool_name: The name of the tool to expand
+    When enabled, tools are sent to the model with abbreviated descriptions.
+    The model can call `expand_tool(name)` to get full details before use.
 
-    Returns:
-        Full tool description and parameter schema
+    Usage:
+        handler = LazyToolHandler()
+        agent = Agent(tools=[...], lazy_tool_handler=handler)
     """
-    registry = _agent.tool_registry
 
-    if tool_name not in registry:
-        return f"Error: Tool '{tool_name}' not found"
+    # If True, block execution of unexpanded tools (safer but stricter)
+    require_expansion: bool = True
 
-    full_spec = registry.get_full_tool_spec(tool_name)
+    # Max chars for auto-generated summaries
+    summary_max_length: int = 100
 
-    # Mark as expanded in invocation state
-    expanded = _invocation_state.setdefault("_expanded_tools", set())
-    expanded.add(tool_name)
+    # Track full specs for expansion
+    _full_specs: dict[str, ToolSpec] = field(default_factory=dict)
 
-    return format_tool_spec_for_model(full_spec)
-```
-
-#### 2.2 Format Helper
-```python
-def format_tool_spec_for_model(spec: ToolSpec) -> str:
-    """Format a tool spec as human-readable text for the model."""
-    lines = [
-        f"## Tool: {spec['name']}",
-        f"\n### Description\n{spec['description']}",
-        f"\n### Parameters\n```json\n{json.dumps(spec['inputSchema'], indent=2)}\n```"
-    ]
-    if spec.get('outputSchema'):
-        lines.append(f"\n### Output Schema\n```json\n{json.dumps(spec['outputSchema'], indent=2)}\n```")
-    return "\n".join(lines)
-```
-
----
-
-### Phase 3: Registry Modifications
-
-#### 3.1 Lazy Spec Generation
-**File:** `src/strands/tools/registry.py`
-
-```python
-class ToolRegistry:
-    def __init__(self, ..., description_mode: ToolDescriptionMode = ToolDescriptionMode.FULL):
-        self._description_mode = description_mode
-        self._expanded_tools: set[str] = set()
-
-    def get_tool_specs_for_model(
+    def transform(
         self,
-        invocation_state: dict | None = None
+        tool_specs: list[ToolSpec],
+        invocation_state: dict[str, Any]
     ) -> list[ToolSpec]:
-        """Get tool specs formatted according to description mode."""
+        """
+        Transform full tool specs into abbreviated versions.
 
-        if self._description_mode == ToolDescriptionMode.FULL:
-            return self.get_all_tool_specs()  # Current behavior
+        Called at event_loop.py:339 - the single injection point.
+        Works for ALL tools including MCP tools.
+        """
+        # Cache full specs for later expansion
+        self._full_specs = {spec["name"]: spec for spec in tool_specs}
 
-        expanded = set()
-        if invocation_state:
-            expanded = invocation_state.get("_expanded_tools", set())
+        # Get already-expanded tools from state
+        expanded = invocation_state.get("_expanded_tools", set())
 
-        specs = []
-        for name, tool in self._tools.items():
+        result = []
+        for spec in tool_specs:
+            name = spec["name"]
             if name in expanded:
-                # Tool was expanded, send full spec
-                specs.append(tool.tool_spec)
+                # Already expanded - send full spec
+                result.append(spec)
             else:
-                # Send lazy spec with summary only
-                specs.append(self._create_lazy_spec(tool))
+                # Send abbreviated spec
+                result.append(self._abbreviate(spec))
 
-        # Always include expand_tool with full spec
-        if self._description_mode == ToolDescriptionMode.LAZY:
-            specs.append(self._expand_tool.tool_spec)
+        # Add our expand_tool (always with full spec)
+        result.append(self._get_expand_tool_spec())
 
-        return specs
+        return result
 
-    def _create_lazy_spec(self, tool: AgentTool) -> ToolSpec:
-        """Create a minimal spec with just name and summary."""
-        full_spec = tool.tool_spec
+    def _abbreviate(self, spec: ToolSpec) -> ToolSpec:
+        """Create abbreviated spec with just name and summary."""
+        summary = self._extract_summary(spec.get("description", ""))
         return {
-            "name": full_spec["name"],
-            "description": self._get_summary(tool),
-            "inputSchema": {"json": {"type": "object", "properties": {}}}
+            "name": spec["name"],
+            "description": f"[Abbreviated] {summary} Use expand_tool('{spec['name']}') for full details.",
+            "inputSchema": {"json": {"type": "object", "properties": {}}},
         }
 
-    def _get_summary(self, tool: AgentTool) -> str:
-        """Get or generate a summary for the tool."""
-        # Check for explicit summary
-        if hasattr(tool, 'summary') and tool.summary:
-            return tool.summary
+    def _extract_summary(self, description: str) -> str:
+        """Extract first sentence as summary."""
+        if not description:
+            return "No description available."
 
-        # Extract first sentence from description
-        desc = tool.tool_spec.get("description", "")
-        first_sentence = desc.split(". ")[0]
-        return first_sentence + "." if first_sentence else "No description available."
+        # Get first sentence
+        first_sentence = description.split(". ")[0].strip()
+
+        # Truncate if needed
+        if len(first_sentence) > self.summary_max_length:
+            return first_sentence[:self.summary_max_length - 3] + "..."
+
+        return first_sentence + ("." if not first_sentence.endswith(".") else "")
+
+    def expand(self, tool_name: str, invocation_state: dict[str, Any]) -> str:
+        """
+        Expand a tool to get its full description.
+        Called by the expand_tool tool.
+        """
+        if tool_name not in self._full_specs:
+            available = ", ".join(sorted(self._full_specs.keys()))
+            return f"Error: Tool '{tool_name}' not found. Available tools: {available}"
+
+        # Mark as expanded
+        expanded = invocation_state.setdefault("_expanded_tools", set())
+        expanded.add(tool_name)
+
+        # Return formatted full spec
+        spec = self._full_specs[tool_name]
+        return self._format_spec(spec)
+
+    def _format_spec(self, spec: ToolSpec) -> str:
+        """Format a tool spec for the model to read."""
+        schema_str = json.dumps(spec.get("inputSchema", {}), indent=2)
+        return f"""## Tool: {spec['name']}
+
+### Description
+{spec.get('description', 'No description')}
+
+### Parameters
+```json
+{schema_str}
+```
+
+You can now call this tool with the parameters shown above."""
+
+    def _get_expand_tool_spec(self) -> ToolSpec:
+        """Get the spec for expand_tool itself."""
+        return {
+            "name": "expand_tool",
+            "description": (
+                "Get the full description and parameter schema for a tool. "
+                "Call this BEFORE using any tool to see its complete documentation and required parameters."
+            ),
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {
+                            "type": "string",
+                            "description": "The name of the tool to expand"
+                        }
+                    },
+                    "required": ["tool_name"]
+                }
+            }
+        }
+
+    def should_block_unexpanded(self, tool_name: str, invocation_state: dict[str, Any]) -> bool:
+        """Check if a tool call should be blocked because it wasn't expanded."""
+        if not self.require_expansion:
+            return False
+        if tool_name == "expand_tool":
+            return False
+        expanded = invocation_state.get("_expanded_tools", set())
+        return tool_name not in expanded
+
+    def get_block_message(self, tool_name: str) -> str:
+        """Get the message to return when blocking an unexpanded tool."""
+        return (
+            f"This tool has not been expanded yet. Please call expand_tool('{tool_name}') "
+            f"first to see the full description and required parameters, then try again."
+        )
+
+
+# The actual tool function that gets registered
+def create_expand_tool(handler: LazyToolHandler):
+    """Create the expand_tool function bound to a handler."""
+
+    @tool(name="expand_tool")
+    def expand_tool(
+        tool_name: str,
+        _invocation_state: dict[str, Any],
+    ) -> str:
+        """
+        Get the full description and parameter schema for a tool.
+
+        Args:
+            tool_name: The name of the tool to expand
+
+        Returns:
+            Complete tool documentation including description and parameters
+        """
+        return handler.expand(tool_name, _invocation_state)
+
+    return expand_tool
 ```
 
 ---
 
-### Phase 4: Agent Configuration
-
-#### 4.1 Agent Constructor Update
-**File:** `src/strands/agent/agent.py`
+### File 2: `src/strands/agent/agent.py` (minimal change)
 
 ```python
-class Agent:
-    def __init__(
-        self,
-        ...,
-        tool_description_mode: ToolDescriptionMode | str = ToolDescriptionMode.FULL,
-    ):
-        # Convert string to enum if needed
-        if isinstance(tool_description_mode, str):
-            tool_description_mode = ToolDescriptionMode(tool_description_mode)
+# In __init__, add ONE parameter:
+def __init__(
+    self,
+    ...,
+    lazy_tool_handler: "LazyToolHandler | None" = None,  # NEW
+):
+    ...
+    self.lazy_tool_handler = lazy_tool_handler
 
-        self._tool_description_mode = tool_description_mode
-
-        # Auto-register expand_tool if in lazy mode
-        if tool_description_mode == ToolDescriptionMode.LAZY:
-            self.tool_registry.register_tool(expand_tool)
+    # Register expand_tool if handler provided
+    if lazy_tool_handler:
+        from strands.tools.lazy_tool_handler import create_expand_tool
+        self.tool_registry.register_tool(create_expand_tool(lazy_tool_handler))
 ```
 
-#### 4.2 Event Loop Integration
-**File:** `src/strands/event_loop/event_loop.py`
+---
+
+### File 3: `src/strands/event_loop/event_loop.py` (single injection point)
 
 ```python
-# Line ~339: Change from:
+# Around line 339, change:
 tool_specs = agent.tool_registry.get_all_tool_specs()
 
 # To:
-tool_specs = agent.tool_registry.get_tool_specs_for_model(invocation_state)
+tool_specs = agent.tool_registry.get_all_tool_specs()
+if agent.lazy_tool_handler:
+    tool_specs = agent.lazy_tool_handler.transform(tool_specs, invocation_state)
 ```
 
 ---
 
-### Phase 5: Tool Validation Handling
-
-When in lazy mode, the model might try to call a tool without expanding it first. Handle gracefully:
-
-#### 5.1 Pre-execution Check
-**File:** `src/strands/tools/executors/_executor.py`
+### File 4: `src/strands/tools/executors/_executor.py` (optional blocking)
 
 ```python
-@staticmethod
-async def _stream(...):
-    # Check if tool needs expansion first
-    if agent._tool_description_mode == ToolDescriptionMode.LAZY:
-        expanded = invocation_state.get("_expanded_tools", set())
-        if tool_name not in expanded and tool_name != "expand_tool":
-            # Return helpful message instead of executing
-            yield ToolResultEvent(
-                tool_use_id=tool_use["toolUseId"],
-                status="error",
-                content=f"Please use expand_tool('{tool_name}') first to see the full "
-                        f"description and parameters before calling this tool."
-            )
-            return
-
-    # Continue with normal execution...
+# At the start of _stream(), add:
+if agent.lazy_tool_handler and agent.lazy_tool_handler.should_block_unexpanded(tool_name, invocation_state):
+    yield ToolResultEvent(
+        tool_use_id=tool_use["toolUseId"],
+        status="error",
+        content=agent.lazy_tool_handler.get_block_message(tool_name)
+    )
+    return
 ```
 
 ---
 
-### Phase 6: Summary Extraction Enhancement
-
-#### 6.1 Automatic Summary Generation
-**File:** `src/strands/tools/decorator.py`
-
-```python
-def _extract_summary_from_docstring(docstring: str | None) -> str:
-    """Extract a concise summary from a docstring."""
-    if not docstring:
-        return "No description available."
-
-    # Get first paragraph (up to blank line)
-    paragraphs = docstring.strip().split("\n\n")
-    first_para = paragraphs[0].replace("\n", " ").strip()
-
-    # Limit to ~100 chars for summary
-    if len(first_para) > 100:
-        # Find last complete sentence within limit
-        sentences = first_para.split(". ")
-        summary = ""
-        for sentence in sentences:
-            if len(summary) + len(sentence) < 100:
-                summary += sentence + ". "
-            else:
-                break
-        return summary.strip() or first_para[:97] + "..."
-
-    return first_para
-```
-
----
-
-## Usage Example
+## Usage
 
 ```python
 from strands import Agent
-from strands.types.tools import ToolDescriptionMode
+from strands.tools.lazy_tool_handler import LazyToolHandler
 
-# Create agent with lazy tool descriptions
+# Enable lazy loading
+handler = LazyToolHandler(require_expansion=True)
 agent = Agent(
-    model=my_model,
-    tools=[tool1, tool2, tool3, ...many_tools...],
-    tool_description_mode=ToolDescriptionMode.LAZY
+    tools=[tool1, tool2, ...many_tools...],
+    lazy_tool_handler=handler
 )
 
-# The agent will now:
-# 1. Send summaries for all tools
-# 2. Model calls expand_tool("tool2") when it needs details
-# 3. Model then calls tool2 with correct parameters
-result = agent("Perform a complex task requiring tool2")
+# Disabled (default) - no code paths affected
+agent = Agent(tools=[tool1, tool2, ...])  # lazy_tool_handler=None
 ```
 
 ---
 
-## Context Savings Analysis
+## Why This Design is Clean
 
-**Example with 20 tools:**
-
-| Mode | Tokens per tool | Total tokens |
-|------|-----------------|--------------|
-| FULL | ~200 (desc + schema) | ~4,000 |
-| LAZY (summary) | ~30 | ~600 |
-| LAZY (after 3 expansions) | ~30×17 + ~200×3 | ~1,110 |
-
-**Savings:** 70-85% context reduction for typical usage patterns.
-
----
-
-## Testing Strategy
-
-### Unit Tests
-1. `test_lazy_spec_generation` - Verify summary extraction
-2. `test_expand_tool_returns_full_spec` - Meta-tool functionality
-3. `test_unexpanded_tool_blocked` - Validation behavior
-4. `test_expanded_tools_tracked` - State management
-
-### Integration Tests
-1. `test_lazy_mode_end_to_end` - Full agent flow
-2. `test_model_learns_to_expand` - Model behavior with lazy tools
-3. `test_mixed_expanded_unexpanded` - Partial expansion state
-
-### Performance Tests
-1. `test_context_savings` - Measure actual token reduction
-2. `test_api_call_overhead` - Measure expansion round-trip cost
+| Aspect | Benefit |
+|--------|---------|
+| **Single new file** | All logic in `lazy_tool_handler.py` |
+| **Single injection point** | Only `event_loop.py:339` transforms specs |
+| **Works for ALL tools** | MCP tools pass through same point |
+| **Zero impact when disabled** | `if agent.lazy_tool_handler:` guards everything |
+| **No type changes** | Uses existing `ToolSpec` type |
+| **No decorator changes** | Auto-extracts summaries from existing descriptions |
+| **Testable in isolation** | Handler class can be unit tested independently |
 
 ---
 
-## Migration & Backwards Compatibility
+## Files Changed
 
-- Default `tool_description_mode=FULL` preserves current behavior
-- No changes required for existing code
-- Opt-in via configuration parameter
+| File | Change | Lines |
+|------|--------|-------|
+| `src/strands/tools/lazy_tool_handler.py` | **NEW** | ~150 |
+| `src/strands/agent/agent.py` | Add parameter + register | ~5 |
+| `src/strands/event_loop/event_loop.py` | Single transform call | ~3 |
+| `src/strands/tools/executors/_executor.py` | Optional blocking | ~5 |
 
----
-
-## Future Enhancements
-
-1. **Smart Expansion Hints:** System suggests tools to expand based on task
-2. **Persistent Expansion Cache:** Remember expanded tools across invocations
-3. **Category-based Expansion:** "Expand all file tools"
-4. **Usage-based Caching:** Auto-expand frequently used tools
+**Total: ~163 lines, mostly in one new file**
 
 ---
 
-## Files to Modify/Create
+## Open Questions
 
-| File | Action | Description |
-|------|--------|-------------|
-| `src/strands/types/tools.py` | Modify | Add LazyToolSpec, ToolDescriptionMode |
-| `src/strands/tools/expand_tool.py` | Create | Meta-tool implementation |
-| `src/strands/tools/decorator.py` | Modify | Add summary extraction, summary param |
-| `src/strands/tools/registry.py` | Modify | Add lazy spec generation |
-| `src/strands/agent/agent.py` | Modify | Add tool_description_mode param |
-| `src/strands/event_loop/event_loop.py` | Modify | Use new spec method |
-| `src/strands/tools/executors/_executor.py` | Modify | Add expansion validation |
-| `tests/test_lazy_tools.py` | Create | Test suite |
+1. **Block vs warn on unexpanded calls?**
+   - Configurable via `require_expansion` parameter
 
----
+2. **Persist expanded state across invocations?**
+   - Currently per-invocation; could add `persistent=True` option
 
-## Open Questions for Discussion
-
-1. **Should expand_tool count against tool call limits?**
-   - Probably not, since it's infrastructure
-
-2. **What if model ignores expand_tool and guesses parameters?**
-   - Option: Block execution (recommended for correctness)
-   - Option: Allow with warning (more flexible)
-
-3. **Should we support "expand all" for small tool sets?**
-   - Could add `expand_tool(name="*")` pattern
-
-4. **How to handle MCP tools?**
-   - MCP tools have their own description mechanism
-   - May need adapter layer
-
-5. **Should expanded state persist across conversation turns?**
-   - Yes, within same invocation
-   - Configurable for multi-turn conversations
+3. **Support `expand_tool("*")` for expand-all?**
+   - Easy to add in the handler's `expand()` method
