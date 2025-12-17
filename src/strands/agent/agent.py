@@ -35,6 +35,7 @@ from ..tools._tool_helpers import generate_missing_tool_result_content
 
 if TYPE_CHECKING:
     from ..experimental.tools import ToolProvider
+    from ..tools.lazy_tool_handler import LazyToolHandler
 from ..handlers.callback_handler import PrintingCallbackHandler, null_callback_handler
 from ..hooks import (
     AfterInvocationEvent,
@@ -124,6 +125,7 @@ class Agent:
         hooks: Optional[list[HookProvider]] = None,
         session_manager: Optional[SessionManager] = None,
         tool_executor: Optional[ToolExecutor] = None,
+        lazy_tool_handler: Optional["LazyToolHandler"] = None,
     ):
         """Initialize the Agent with the specified configuration.
 
@@ -173,6 +175,10 @@ class Agent:
             session_manager: Manager for handling agent sessions including conversation history and state.
                 If provided, enables session-based persistence and state management.
             tool_executor: Definition of tool execution strategy (e.g., sequential, concurrent, etc.).
+            lazy_tool_handler: Handler for lazy tool description loading.
+                When provided, tools are sent to the model with abbreviated descriptions.
+                The model can call `expand_tool(name)` to get full details before use.
+                This can significantly reduce context window usage with many tools.
 
         Raises:
             ValueError: If agent id contains path separators.
@@ -251,6 +257,13 @@ class Agent:
             self.hooks.add_hook(self._session_manager)
 
         self.tool_executor = tool_executor or ConcurrentToolExecutor()
+
+        # Initialize lazy tool handler for context-saving tool descriptions
+        self.lazy_tool_handler = lazy_tool_handler
+        if lazy_tool_handler:
+            from ..tools.lazy_tool_handler import create_expand_tool
+
+            self.tool_registry.register_tool(create_expand_tool(lazy_tool_handler))
 
         if hooks:
             for hook in hooks:

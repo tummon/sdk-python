@@ -127,6 +127,21 @@ class ToolExecutor(abc.ABC):
         tool_func = tool_info if tool_info is not None else agent.tool_registry.registry.get(tool_name)
         tool_spec = tool_func.tool_spec if tool_func is not None else None
 
+        # Check if lazy tool handler requires expansion before use
+        if (
+            ToolExecutor._is_agent(agent)
+            and agent.lazy_tool_handler
+            and agent.lazy_tool_handler.should_block_unexpanded(tool_name, invocation_state)
+        ):
+            block_result: ToolResult = {
+                "toolUseId": str(tool_use.get("toolUseId")),
+                "status": "error",
+                "content": [{"text": agent.lazy_tool_handler.get_block_message(tool_name)}],
+            }
+            yield ToolResultEvent(block_result)
+            tool_results.append(block_result)
+            return
+
         current_span = trace_api.get_current_span()
         if current_span and tool_spec is not None:
             current_span.set_attribute("gen_ai.tool.description", tool_spec["description"])

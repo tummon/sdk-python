@@ -337,6 +337,9 @@ async def _handle_model_execution(
                 tool_specs = [tool_spec] if tool_spec else []
             else:
                 tool_specs = agent.tool_registry.get_all_tool_specs()
+                # Apply lazy tool handler transformation if configured
+                if agent.lazy_tool_handler:
+                    tool_specs = agent.lazy_tool_handler.transform(tool_specs, invocation_state)
             try:
                 async for event in stream_messages(
                     agent.model,
