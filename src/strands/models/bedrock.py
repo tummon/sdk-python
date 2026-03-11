@@ -89,6 +89,9 @@ class BedrockModel(Model):
             guardrail_redact_output_message: If a Bedrock Output guardrail triggers, replace output with this message.
             guardrail_latest_message: Flag to send only the lastest user message to guardrails.
                 Defaults to False.
+            guardrail_only_user_input: Flag to wrap all user text and image content in guardContent blocks
+                so that only actual user input is evaluated by guardrails, excluding tool results.
+                Defaults to False.
             max_tokens: Maximum number of tokens to generate in the response
             model_id: The Bedrock model ID (e.g., "us.anthropic.claude-sonnet-4-20250514-v1:0")
             include_tool_result_status: Flag to include status field in tool results.
@@ -114,6 +117,7 @@ class BedrockModel(Model):
         guardrail_redact_output: bool | None
         guardrail_redact_output_message: str | None
         guardrail_latest_message: bool | None
+        guardrail_only_user_input: bool | None
         max_tokens: int | None
         model_id: str
         include_tool_result_status: Literal["auto"] | bool | None
@@ -414,7 +418,17 @@ class BedrockModel(Model):
         # This ensures guardContent wrapping is maintained across tool execution cycles, where
         # the final message in the list is a toolResult (role=user) rather than text/image content.
         last_user_text_idx = None
-        if self.config.get("guardrail_latest_message", False):
+        guardrail_latest_message = self.config.get("guardrail_latest_message", False)
+        guardrail_only_user_input = self.config.get("guardrail_only_user_input", False)
+
+        if guardrail_latest_message and guardrail_only_user_input:
+            logger.warning(
+                "Both guardrail_latest_message and guardrail_only_user_input are enabled. "
+                "guardrail_only_user_input already wraps all user messages, "
+                "making guardrail_latest_message redundant."
+            )
+
+        if guardrail_latest_message and not guardrail_only_user_input:
             last_user_text_idx = self._find_last_user_text_message_index(messages)
 
         for idx, message in enumerate(messages):
@@ -437,8 +451,15 @@ class BedrockModel(Model):
                 if formatted_content is None:
                     continue
 
-                # Wrap text or image content in guardContent if this is the last user text/image message
-                if idx == last_user_text_idx and ("text" in formatted_content or "image" in formatted_content):
+                # Wrap text or image content in guardContent so only actual user input is
+                # evaluated by guardrails, excluding tool results which cannot be wrapped.
+                should_wrap_guard_content = (
+                    # guardrail_only_user_input: wrap all user text/image across entire conversation
+                    (guardrail_only_user_input and message["role"] == "user")
+                    # guardrail_latest_message: wrap only the last user text/image message
+                    or idx == last_user_text_idx
+                )
+                if should_wrap_guard_content and ("text" in formatted_content or "image" in formatted_content):
                     if "text" in formatted_content:
                         formatted_content = {"guardContent": {"text": {"text": formatted_content["text"]}}}
                     elif "image" in formatted_content:

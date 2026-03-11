@@ -2856,3 +2856,149 @@ def test_guardrail_latest_message_disabled_does_not_wrap(model):
 
     assert "text" in formatted
     assert "guardContent" not in formatted
+
+
+def test_guardrail_only_user_input_wraps_all_user_text_and_image(model):
+    """Test that guardrail_only_user_input wraps all user text and image content across the conversation."""
+    model.update_config(
+        guardrail_id="test-guardrail",
+        guardrail_version="DRAFT",
+        guardrail_only_user_input=True,
+    )
+
+    messages = [
+        {"role": "user", "content": [{"text": "First message"}]},
+        {"role": "assistant", "content": [{"text": "First response"}]},
+        {
+            "role": "user",
+            "content": [
+                {"text": "Second message"},
+                {"image": {"format": "png", "source": {"bytes": b"fake_image_data"}}},
+            ],
+        },
+    ]
+
+    request = model._format_request(messages)
+    formatted_messages = request["messages"]
+
+    assert len(formatted_messages) == 3
+
+    # First user message text should be wrapped
+    assert "guardContent" in formatted_messages[0]["content"][0]
+    assert formatted_messages[0]["content"][0]["guardContent"]["text"]["text"] == "First message"
+
+    # Assistant message should NOT be wrapped
+    assert "text" in formatted_messages[1]["content"][0]
+    assert formatted_messages[1]["content"][0]["text"] == "First response"
+
+    # Second user message text should be wrapped
+    assert "guardContent" in formatted_messages[2]["content"][0]
+    assert formatted_messages[2]["content"][0]["guardContent"]["text"]["text"] == "Second message"
+
+    # Second user message image should also be wrapped
+    assert "guardContent" in formatted_messages[2]["content"][1]
+    assert formatted_messages[2]["content"][1]["guardContent"]["image"]["format"] == "png"
+
+
+def test_guardrail_only_user_input_excludes_tool_results(model):
+    """Test that guardrail_only_user_input does not wrap toolResult blocks."""
+    model.update_config(
+        guardrail_id="test-guardrail",
+        guardrail_version="DRAFT",
+        guardrail_only_user_input=True,
+    )
+
+    messages = [
+        {"role": "user", "content": [{"text": "What is the weather?"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "toolUse": {
+                        "toolUseId": "tool-1",
+                        "name": "get_weather",
+                        "input": {"location": "Seattle"},
+                    }
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": "tool-1",
+                        "content": [{"text": "You are in Seattle. The weather is sunny."}],
+                        "status": "success",
+                    }
+                }
+            ],
+        },
+        {"role": "assistant", "content": [{"text": "The weather in Seattle is sunny."}]},
+        {"role": "user", "content": [{"text": "Thanks!"}]},
+    ]
+
+    request = model._format_request(messages)
+    formatted_messages = request["messages"]
+
+    assert len(formatted_messages) == 5
+
+    # First user text should be wrapped
+    assert "guardContent" in formatted_messages[0]["content"][0]
+    assert formatted_messages[0]["content"][0]["guardContent"]["text"]["text"] == "What is the weather?"
+
+    # Tool result user message should NOT have guardContent wrapping on the toolResult itself
+    tool_result_content = formatted_messages[2]["content"][0]
+    assert "toolResult" in tool_result_content
+    assert "guardContent" not in tool_result_content
+
+    # Last user text should be wrapped
+    assert "guardContent" in formatted_messages[4]["content"][0]
+    assert formatted_messages[4]["content"][0]["guardContent"]["text"]["text"] == "Thanks!"
+
+
+def test_guardrail_only_user_input_disabled_does_not_wrap(model):
+    """Test that guardContent wrapping is skipped when guardrail_only_user_input is not set."""
+    messages = [
+        {"role": "user", "content": [{"text": "Hello"}]},
+        {"role": "assistant", "content": [{"text": "Hi"}]},
+        {"role": "user", "content": [{"text": "Goodbye"}]},
+    ]
+
+    request = model._format_request(messages)
+
+    # No wrapping on any user message
+    assert "text" in request["messages"][0]["content"][0]
+    assert "guardContent" not in request["messages"][0]["content"][0]
+    assert "text" in request["messages"][2]["content"][0]
+    assert "guardContent" not in request["messages"][2]["content"][0]
+
+
+def test_guardrail_both_latest_message_and_only_user_input_warns(model, caplog):
+    """Test that enabling both guardrail_latest_message and guardrail_only_user_input logs a warning."""
+    model.update_config(
+        guardrail_id="test-guardrail",
+        guardrail_version="DRAFT",
+        guardrail_latest_message=True,
+        guardrail_only_user_input=True,
+    )
+
+    messages = [
+        {"role": "user", "content": [{"text": "First message"}]},
+        {"role": "assistant", "content": [{"text": "Response"}]},
+        {"role": "user", "content": [{"text": "Second message"}]},
+    ]
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        request = model._format_request(messages)
+
+    # Warning should be logged about redundant config
+    assert any(
+        "guardrail_latest_message" in record.message and "redundant" in record.message for record in caplog.records
+    )
+
+    # guardrail_only_user_input behavior should still work — all user messages wrapped
+    assert "guardContent" in request["messages"][0]["content"][0]
+    assert "guardContent" in request["messages"][2]["content"][0]
